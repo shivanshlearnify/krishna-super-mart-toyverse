@@ -1,22 +1,36 @@
 import fs from "fs";
 import path from "path";
 import admin from "firebase-admin";
-import { authenticate } from "../shopify.server";
+import { shopifyApi, ApiVersion } from "../shopify.server";
 
 export const config = {
-  authenticate: {
-    admin: {
-      allowUnauthenticated: true,   // <-- IMPORTANT
-    },
-  },
+  authenticate: { admin: { allowUnauthenticated: true } },
 };
 
+// ----------------------------
+// CONFIG
+// ----------------------------
+const FIREBASE_COLLECTION = "productCollection"; // update if needed
+const SHOP = "krishna-super-mart-toyverse-devstore.myshopify.com";
 
-const FIREBASE_COLLECTION = "productCollection"; // or your actual collection name
+// ----------------------------
+// INIT SHOPIFY ADMIN CLIENT
+// ----------------------------
+const shopify = shopifyApi({
+  apiKey: process.env.SHOPIFY_API_KEY,
+  apiSecretKey: process.env.SHOPIFY_API_SECRET,
+  adminApiAccessToken: process.env.SHOPIFY_ADMIN_TOKEN, // IMPORTANT!
+  hostName: SHOP,
+  apiVersion: ApiVersion.January25,
+});
 
+const rest = shopify.rest;
 
+// ----------------------------
+// FIREBASE INITIALIZATION
+// ----------------------------
 function initFirebaseFromEnv() {
-  if (admin.apps && admin.apps.length) return;
+  if (admin.apps.length) return;
 
   const svcPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH;
   const svcJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
@@ -27,193 +41,164 @@ function initFirebaseFromEnv() {
       throw new Error(`Firebase service account file not found at ${fullPath}`);
     }
     const key = JSON.parse(fs.readFileSync(fullPath, "utf8"));
-    admin.initializeApp({
-      credential: admin.credential.cert(key),
-    });
+    admin.initializeApp({ credential: admin.credential.cert(key) });
   } else if (svcJson) {
     const key = JSON.parse(svcJson);
-    admin.initializeApp({
-      credential: admin.credential.cert(key),
-    });
+    admin.initializeApp({ credential: admin.credential.cert(key) });
   } else {
     throw new Error(
-      "No Firebase credentials found. Set FIREBASE_SERVICE_ACCOUNT_PATH or FIREBASE_SERVICE_ACCOUNT_JSON in env.",
+      "No Firebase credentials found. Set FIREBASE_SERVICE_ACCOUNT_PATH or FIREBASE_SERVICE_ACCOUNT_JSON",
     );
   }
 }
 
-// Basic helper to throttle between calls
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Export a GET loader so visiting this URL triggers migration.
-// Protect it with MIGRATION_SECRET query param.
+// ----------------------------
+// MAIN LOADER (GET API CALL)
+// ----------------------------
 export async function loader({ request }) {
   try {
-    // require secret
     const url = new URL(request.url);
+
+    // 🔐 Check migration secret
     const secret = url.searchParams.get("secret");
     if (!secret || secret !== process.env.MIGRATION_SECRET) {
-      return new Response("Unauthorized - missing or invalid secret", {
-        status: 401,
-      });
+      return new Response("Unauthorized - invalid secret", { status: 401 });
     }
 
-    // Shopify admin session
-    const { session } = await authenticate.admin(request);
-    if (!session) {
-      return new Response("No Shopify session. Install app and re-open.", {
-        status: 401,
-      });
-    }
-
-    // init firebase
+    // 🔥 Init Firebase
     initFirebaseFromEnv();
     const db = admin.firestore();
 
+    // Fetch all documents
     const snapshot = await db.collection(FIREBASE_COLLECTION).get();
     const docs = snapshot.docs;
+
     let migrated = 0;
-    const BATCH_SIZE = 10; // safe small batches
+    const BATCH_SIZE = 10;
 
     for (let i = 0; i < docs.length; i += BATCH_SIZE) {
       const batch = docs.slice(i, i + BATCH_SIZE);
 
-      // Create each product in batch sequentially (safe)
       for (const docSnap of batch) {
         const p = docSnap.data();
         const docRef = docSnap.ref;
 
-        // skip if already migrated
+        // Already migrated?
         if (p.shopifyId) {
-          console.log(
-            `Skipping ${docSnap.id} already migrated to ${p.shopifyId}`,
-          );
+          console.log(`Skipping ${docSnap.id} already migrated`);
           continue;
         }
 
-        // Basic transform — update to match your fields
+        // PRODUCT PAYLOAD
         const productPayload = {
           product: {
             title: p.name || "Untitled Product",
             body_html: "",
             vendor: p.supplier || "Unknown",
             product_type: p.group || "",
-
             tags: p.subCategory ? [p.subCategory] : [],
             variants: [
               {
-                price: p.rate.toString(),
+                price: p.rate?.toString(),
                 sku: p.barcode || undefined,
                 inventory_management: "shopify",
-                inventory_quantity:
-                  typeof p.stock === "number" ? p.stock : undefined,
-                compare_at_price: p.mrp ? p.mrp.toString() : undefined,
+                inventory_quantity: Number.isFinite(p.stock)
+                  ? p.stock
+                  : undefined,
+                compare_at_price: p.mrp?.toString(),
               },
             ],
             images:
-              p.images && Array.isArray(p.images) && p.images.length
+              Array.isArray(p.images) && p.images.length
                 ? p.images.map((url) => ({ src: url }))
                 : [],
           },
         };
 
         try {
-          // Create product in Shopify via REST
-          const created = await session.rest.Product.create({
-            session,
+          // -----------------------------
+          // CREATE PRODUCT IN SHOPIFY
+          // -----------------------------
+          const created = await rest.Product.create({
+            shop: SHOP,
             data: productPayload,
           });
 
-          const shopifyProduct =
-            created?.body?.product || created?.product || null;
-          const shopifyId = shopifyProduct?.id;
+          const shopifyId = created?.product?.id;
+          console.log(`✔ Created ${shopifyId}`);
 
-          // create metafields (if needed)
+          // -----------------------------
+          // CREATE METAFIELDS
+          // -----------------------------
           const metafields = [
+            { key: "brand", type: "single_line_text_field", value: p.brand },
             {
-              namespace: "custom",
-              key: "brand",
-              type: "single_line_text_field",
-              value: p.brand || "",
-            },
-            {
-              namespace: "custom",
               key: "suppdate",
               type: "single_line_text_field",
-              value: p.suppdate || "",
+              value: p.suppdate,
             },
             {
-              namespace: "custom",
               key: "suppinvo",
               type: "single_line_text_field",
-              value: p.suppinvo || "",
+              value: p.suppinvo,
             },
-            {
-              namespace: "custom",
-              key: "value",
-              type: "number_integer",
-              value: p.value || 0,
-            },
+            { key: "value", type: "number_integer", value: p.value },
           ];
 
           for (const mf of metafields) {
-            // create only if non-empty
             if (!mf.value) continue;
-            await session.rest.Metafield.create({
-              session,
+
+            await rest.Metafield.create({
+              shop: SHOP,
               data: {
                 metafield: {
                   owner_resource: "product",
                   owner_id: shopifyId,
-                  namespace: mf.namespace,
+                  namespace: "custom",
                   key: mf.key,
                   type: mf.type,
                   value: String(mf.value),
                 },
               },
             });
-            // small pause
+
             await sleep(200);
           }
 
-          // update firebase doc with shopify id and migratedAt
+          // -----------------------------
+          // UPDATE FIREBASE
+          // -----------------------------
           await docRef.update({
             shopifyId,
             migratedAt: new Date().toISOString(),
           });
 
           migrated++;
-          console.log(
-            `Migrated Firebase ${docSnap.id} -> Shopify ${shopifyId}`,
-          );
+          console.log(`Migrated Firebase ${docSnap.id} → Shopify ${shopifyId}`);
         } catch (err) {
-          console.error(
-            "Error migrating doc",
-            docSnap.id,
-            err?.response || err?.message || err,
-          );
-          // continue with next product
+          console.error("Migration error:", err);
         }
 
-        // small throttle between products to be safe
         await sleep(350);
-      } // end of batch
+      }
 
-      // longer pause between batches
       await sleep(1000);
-    } // end loop
+    }
 
     return new Response(JSON.stringify({ success: true, migrated }), {
       headers: { "Content-Type": "application/json" },
     });
   } catch (err) {
     console.error("Migration error:", err);
-    return new Response(JSON.stringify({ error: err.message || String(err) }), {
+    return new Response(JSON.stringify({ error: err.message }), {
       status: 500,
       headers: { "Content-Type": "application/json" },
     });
   }
 }
+
 export async function action({ request }) {
   return loader({ request });
 }
