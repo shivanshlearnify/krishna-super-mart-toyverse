@@ -13,6 +13,7 @@ include_config_on_deploy = true
 api_version = "2026-01"
 
   [[webhooks.subscriptions]]
+<<<<<<< HEAD
   topics = [ "app/uninstalled" ]
   uri = "/webhooks/app/uninstalled"
 
@@ -20,6 +21,15 @@ api_version = "2026-01"
   topics = [ "app/scopes_update" ]
   uri = "/webhooks/app/scopes_update"
 
+=======
+  topics = [ "app/scopes_update" ]
+  uri = "/webhooks/app/scopes_update"
+
+  [[webhooks.subscriptions]]
+  topics = [ "app/uninstalled" ]
+  uri = "/webhooks/app/uninstalled"
+
+>>>>>>> cca1b6a0566aa69c82e1774e3a14a47e520c9eaf
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
 scopes = "write_products"
